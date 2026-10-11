@@ -218,10 +218,15 @@ app.post('/send_command', authMiddleware, (req, res) => {
     commandHistory.push({ ts: Date.now(), command: String(command).slice(0, 60) });
     if (commandHistory.length > 200) commandHistory.shift();
 
-    // v9: FCM push-wake — if target is a specific device, push immediately so the
-    // phone wakes (no 3s polling wait). Falls back to polling for legacy/any.
+    // v9: FCM push-wake — push immediately so the phone wakes (no polling wait).
+    // Specific target → push to that device only. legacy/any → push to ALL
+    // registered FCM tokens (single-device setup keeps working with no device_id).
     if (target !== 'legacy' && target !== 'any') {
         pushFcmCommand(target, id, command); // fire-and-forget (non-blocking)
+    } else {
+        for (const deviceId of fcmTokens.keys()) {
+            pushFcmCommand(deviceId, id, command);
+        }
     }
 
     console.log(`[${new Date().toISOString()}] CMD ${id.slice(0, 8)} -> ${target}: ${command.slice(0, 80)}`);
@@ -308,6 +313,10 @@ app.post('/mobile_result', authMiddleware, (req, res) => {
         device_id: device_id || null,
         timestamp: new Date().toISOString(),
     });
+
+    // v9: FCM-pushed commands are executed WITHOUT polling; drop the matching
+    // command from the queue here so the phone's 30s poll fallback never re-runs it.
+    if (id) commands.delete(id);
 
     totalResults += 1;
 
