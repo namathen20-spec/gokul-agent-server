@@ -656,7 +656,7 @@ app.get('/live/:id', (req, res) => {
     const id = String(req.params.id).replace(/[^a-zA-Z0-9-]/g, '');
     res.set('Content-Type', 'text/html');
     res.send(`<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>Gokul Live Screen</title>
+<title>AI Agent Live Screen</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{margin:0;background:#000;display:flex;align-items:center;justify-content:center;height:100vh}
 img{max-width:100%;max-height:100vh;object-fit:contain}span{position:fixed;top:10px;left:10px;color:#0f0;font:bold 14px monospace;background:#000c;padding:4px 8px}</style>
