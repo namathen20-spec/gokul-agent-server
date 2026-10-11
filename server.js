@@ -19,6 +19,7 @@ app.use(express.json({ limit: '100mb' }));
 const commands = new Map();   // id -> {command, device, target_device, timestamp}
 const results = new Map();    // id -> {result, device_id, timestamp}
 const devices = new Map();    // device_id -> {name, model, lastSeen, registeredAt}
+const fcmTokens = new Map();  // v9: device_id -> {token, updatedAt} for FCM push-wake
 const MAX_AGE = 10 * 60 * 1000; // 10 min cleanup
 const ONLINE_WINDOW_MS = 20 * 1000; // device online if lastSeen < 20s ago
 
@@ -64,6 +65,59 @@ function authMiddleware(req, res, next) {
         return res.status(401).json({ error: 'Unauthorized - Wrong API Key' });
     }
     next();
+}
+
+// ---------- v9: Firebase Cloud Messaging (push-wake instead of polling) ----------
+
+let admin = null;
+let firebaseMessaging = null;
+
+// Lazy-init Firebase Admin (service account from env var or committed file).
+function initFirebase() {
+    if (firebaseMessaging) return firebaseMessaging;
+    try {
+        let sa;
+        if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+            sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        } else {
+            sa = require('./firebase-service-account.json');
+        }
+        admin = require('firebase-admin');
+        if (admin.apps.length === 0) {
+            admin.initializeApp({ credential: admin.credential.cert(sa) });
+        }
+        firebaseMessaging = admin.messaging();
+        console.log('[FCM] Firebase Admin initialized');
+    } catch (e) {
+        console.error('[FCM] init failed (push disabled):', e.message);
+    }
+    return firebaseMessaging;
+}
+
+// Push a command to one device via FCM high-priority DATA message.
+// Non-blocking: returns a promise; failures are logged, never crash the request.
+function pushFcmCommand(deviceId, commandId, command) {
+    const reg = fcmTokens.get(deviceId);
+    if (!reg) return Promise.resolve(false);
+    const msg = initFirebase();
+    if (!msg) return Promise.resolve(false);
+    return msg.send({
+        token: reg.token,
+        data: {
+            command_id: String(commandId),
+            command: String(command),
+        },
+        android: { priority: 'high' },
+    }).then(() => {
+        console.log(`[FCM] pushed to ${deviceId}: ${String(command).slice(0, 60)}`);
+        return true;
+    }).catch((e) => {
+        console.error(`[FCM] push to ${deviceId} failed:`, e.message);
+        if (e.code === 'messaging/registration-token-not-registered') {
+            fcmTokens.delete(deviceId); // stale token — drop it
+        }
+        return false;
+    });
 }
 
 // ---------- Multi-device helpers (v6) ----------
@@ -164,8 +218,28 @@ app.post('/send_command', authMiddleware, (req, res) => {
     commandHistory.push({ ts: Date.now(), command: String(command).slice(0, 60) });
     if (commandHistory.length > 200) commandHistory.shift();
 
+    // v9: FCM push-wake — if target is a specific device, push immediately so the
+    // phone wakes (no 3s polling wait). Falls back to polling for legacy/any.
+    if (target !== 'legacy' && target !== 'any') {
+        pushFcmCommand(target, id, command); // fire-and-forget (non-blocking)
+    }
+
     console.log(`[${new Date().toISOString()}] CMD ${id.slice(0, 8)} -> ${target}: ${command.slice(0, 80)}`);
     res.json({ status: 'command_sent', id, target_device: target });
+});
+
+// v9: Phone → Server: register its FCM token (for push-wake).
+app.post('/register_fcm', authMiddleware, (req, res) => {
+    const device_id = (req.body && req.body.device_id)
+        || req.headers['x-device-id']
+        || 'legacy';
+    const fcm_token = (req.body && req.body.fcm_token) || '';
+    if (!fcm_token) {
+        return res.status(400).json({ error: 'fcm_token is required' });
+    }
+    fcmTokens.set(device_id, { token: fcm_token, updatedAt: Date.now() });
+    touchDevice(device_id);
+    res.json({ ok: true, device_id });
 });
 
 // Laptop → Server: Wait for result (long-poll up to timeout)
