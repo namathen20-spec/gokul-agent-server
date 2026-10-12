@@ -791,37 +791,20 @@ const telegramMediaStore = new Map();
 async function uploadToTelegram(buffer, mime, filename) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return null;
     try {
-        const m = mime || 'application/octet-stream';
-        const isImage = m.startsWith('image/');
-        const isVideo = m.startsWith('video/');
-        const method = isImage ? 'sendPhoto' : (isVideo ? 'sendVideo' : 'sendDocument');
-        const field = isImage ? 'photo' : (isVideo ? 'video' : 'document');
-        const ext = isImage ? '.jpg' : (isVideo ? '.mp4' : '');
-
+        // sendDocument (NOT sendPhoto) — preserves the FULL original resolution.
+        // (sendPhoto downscales to ~2560px which destroys high-MP camera photos.)
         const form = new FormData();
         form.append('chat_id', TELEGRAM_CHAT_ID);
-        form.append(field, new Blob([buffer], { type: m }), (filename || 'media') + ext);
-
-        const send = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
+        form.append('document', new Blob([buffer], { type: mime || 'application/octet-stream' }), (filename || 'media'));
+        const send = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`, {
             method: 'POST',
             body: form,
         });
         const sdata = await send.json();
-        if (!sdata.ok || !sdata.result) {
-            throw new Error(method + ' failed: ' + String(sdata.description || 'unknown').slice(0, 200));
+        if (!sdata.ok || !sdata.result || !sdata.result.document || !sdata.result.document.file_id) {
+            throw new Error('sendDocument failed: ' + String(sdata.description || 'unknown').slice(0, 200));
         }
-
-        let fileId = null;
-        if (isImage && Array.isArray(sdata.result.photo)) {
-            // photo[] holds multiple sizes; the LAST is the largest resolution.
-            fileId = sdata.result.photo[sdata.result.photo.length - 1].file_id;
-        } else if (isVideo && sdata.result.video) {
-            fileId = sdata.result.video.file_id;
-        } else if (sdata.result.document) {
-            fileId = sdata.result.document.file_id;
-        }
-        if (!fileId) throw new Error('no file_id in ' + method + ' response');
-
+        const fileId = sdata.result.document.file_id;
         const gf = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
         const gdata = await gf.json();
         if (!gdata.ok || !gdata.result || !gdata.result.file_path) {
