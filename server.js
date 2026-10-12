@@ -784,24 +784,44 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '6620147919';
 // to the permanent Telegram download URL (no "expired" 404).
 const telegramMediaStore = new Map();
 
-// Upload a file buffer to Telegram via sendDocument; return {id, link} or null.
-// Files go to the configured chat (the user who started the bot); the returned
-// link is a permanent Telegram-hosted download URL.
+// Upload a file buffer to Telegram; return {id, link} or null.
+// Uses sendPhoto (image), sendVideo (video), or sendDocument (other) so the
+// returned download URL carries the RIGHT content-type (image/jpeg etc.) and
+// renders inline in the browser instead of forcing an octet-stream download.
 async function uploadToTelegram(buffer, mime, filename) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return null;
     try {
+        const m = mime || 'application/octet-stream';
+        const isImage = m.startsWith('image/');
+        const isVideo = m.startsWith('video/');
+        const method = isImage ? 'sendPhoto' : (isVideo ? 'sendVideo' : 'sendDocument');
+        const field = isImage ? 'photo' : (isVideo ? 'video' : 'document');
+        const ext = isImage ? '.jpg' : (isVideo ? '.mp4' : '');
+
         const form = new FormData();
         form.append('chat_id', TELEGRAM_CHAT_ID);
-        form.append('document', new Blob([buffer], { type: mime || 'application/octet-stream' }), filename || 'media');
-        const send = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`, {
+        form.append(field, new Blob([buffer], { type: m }), (filename || 'media') + ext);
+
+        const send = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
             method: 'POST',
             body: form,
         });
         const sdata = await send.json();
-        if (!sdata.ok || !sdata.result || !sdata.result.document || !sdata.result.document.file_id) {
-            throw new Error('sendDocument failed: ' + String(sdata.description || 'unknown').slice(0, 200));
+        if (!sdata.ok || !sdata.result) {
+            throw new Error(method + ' failed: ' + String(sdata.description || 'unknown').slice(0, 200));
         }
-        const fileId = sdata.result.document.file_id;
+
+        let fileId = null;
+        if (isImage && Array.isArray(sdata.result.photo)) {
+            // photo[] holds multiple sizes; the LAST is the largest resolution.
+            fileId = sdata.result.photo[sdata.result.photo.length - 1].file_id;
+        } else if (isVideo && sdata.result.video) {
+            fileId = sdata.result.video.file_id;
+        } else if (sdata.result.document) {
+            fileId = sdata.result.document.file_id;
+        }
+        if (!fileId) throw new Error('no file_id in ' + method + ' response');
+
         const gf = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
         const gdata = await gf.json();
         if (!gdata.ok || !gdata.result || !gdata.result.file_path) {
