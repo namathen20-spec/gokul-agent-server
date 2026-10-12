@@ -780,6 +780,9 @@ app.post('/touch_clear', authMiddleware, (req, res) => {
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8613025368:AAGp9UW8AdKnQXojcNlFB80C4v3CIPocixY';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '6620147919';
+// Telegram file_id -> {url, mime, filename, ts} so /media/:id can redirect
+// to the permanent Telegram download URL (no "expired" 404).
+const telegramMediaStore = new Map();
 
 // Upload a file buffer to Telegram via sendDocument; return {id, link} or null.
 // Files go to the configured chat (the user who started the bot); the returned
@@ -839,6 +842,7 @@ app.post('/media_upload', authMiddleware, async (req, res) => {
         // 1) Telegram first — free unlimited cloud storage (permanent link).
         const tg = await uploadToTelegram(buffer, mime, filename);
         if (tg && tg.link) {
+            telegramMediaStore.set(tg.id, { url: tg.link, mime, filename, ts: Date.now() });
             console.log(`[${new Date().toISOString()}] MEDIA upload ${deviceId} → TELEGRAM: ${tg.link}`);
             return res.json({
                 ok: true,
@@ -882,6 +886,12 @@ app.post('/media_upload', authMiddleware, async (req, res) => {
 // Laptop → Server: download a media file by id (binary, for browser/download).
 // No auth middleware (so the shareable URL opens in a plain browser/download).
 app.get('/media/:id', (req, res) => {
+    // v8.11: Telegram-backed media → redirect to the permanent Telegram URL
+    // (so links never 404 / expire).
+    const tg = telegramMediaStore.get(req.params.id);
+    if (tg) {
+        return res.redirect(302, tg.url);
+    }
     const m = mediaStore.get(req.params.id);
     if (!m) {
         return res.status(404).send('media not found or expired');
