@@ -36,6 +36,198 @@ const mediaStore = new Map();   // media_id -> {mime, data_b64, ts, filename}
 const MEDIA_CAP = 50;           // max stored files (FIFO eviction)
 const MEDIA_TTL_MS = 60 * 60 * 1000;  // 1 hour expiry
 
+// v8.9: Google Drive-backed media (long-life storage). Camera photos/screenshots
+// are uploaded to the Ai_agent folder in Drive instead of the in-memory map so
+// files survive Render restarts. If Drive is unavailable the upload falls back
+// to mediaStore (above) so the system never breaks.
+//
+// Service account: ai-agent-drive@gokul-agent-511317.iam.gserviceaccount.com
+// Creds come from env GOOGLE_APPLICATION_CREDENTIALS (JSON string) or the
+// committed ./drive-service-account.json file.
+//
+// We authenticate via google-auth-library (service-account OAuth token) and call
+// the Drive v3 REST API directly with the built-in `fetch` (Node 18+). This gives
+// us deterministic Content-Length on the multipart upload, which `googleapis`'s
+// stream-based media path does not (Drive multipart rejects chunked uploads).
+//
+// NOTE on storage quota: a bare service account has ZERO Drive storage quota
+// (storageQuota.limit == "0"), so a direct upload is rejected with a 403
+// "storageQuotaExceeded". To actually persist files, ONE of these must be set up
+// on the Google side:
+//   (a) OAuth refresh token (works for PERSONAL accounts like @gmail.com): set
+//       DRIVE_OAUTH_REFRESH_TOKEN (+ DRIVE_OAUTH_CLIENT_ID/DRIVE_OAUTH_CLIENT_SECRET)
+//       so uploads run under that user's own 5TB quota.
+//   (b) Domain-wide delegation: grant the service account the Drive scope in the
+//       Workspace Admin console, then set DRIVE_IMPERSONATE_EMAIL to the user it
+//       should impersonate (files land in that user's Drive with their quota).
+//   (c) A Shared Drive: point DRIVE_FOLDER_ID at a folder inside a shared drive.
+// Until then, uploads fall back to the in-memory mediaStore (never crash).
+const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || '145dIFzggdi6UuI5Yt28YBYp0BTvUcZDc';
+let driveAuth = null;    // google-auth-library GoogleAuth (lazy-initialized)
+let driveFailed = false; // sticky flag: skip re-init after a hard failure
+
+// Lazy-init Drive auth. NEVER throws — returns null if creds are missing/bad
+// (or google-auth-library isn't installed), in which case media falls back to
+// the in-memory store.
+//
+// Auth mode is picked by env, highest-priority first:
+//   (1) DRIVE_OAUTH_REFRESH_TOKEN (personal Google account, e.g. @gmail.com) —
+//       uploads run under the user's own Drive quota (5TB). This is the only
+//       path that works for a personal-account folder owner, because a bare
+//       service account has ZERO storage quota.
+//   (2) Service account (GOOGLE_APPLICATION_CREDENTIALS or
+//       ./drive-service-account.json), optionally impersonating a Workspace
+//       user via DRIVE_IMPERSONATE_EMAIL (domain-wide delegation).
+function initDrive() {
+    if (driveAuth) return driveAuth;
+    if (driveFailed) return null;
+    try {
+        const { GoogleAuth } = require('google-auth-library');
+        const scope = 'https://www.googleapis.com/auth/drive'; // create + link-share
+
+        // (1) Personal account OAuth refresh token → user's own 5TB quota.
+        if (process.env.DRIVE_OAUTH_REFRESH_TOKEN) {
+            driveAuth = new GoogleAuth({
+                credentials: {
+                    type: 'authorized_user',
+                    client_id: process.env.DRIVE_OAUTH_CLIENT_ID || '',
+                    client_secret: process.env.DRIVE_OAUTH_CLIENT_SECRET || '',
+                    refresh_token: process.env.DRIVE_OAUTH_REFRESH_TOKEN,
+                },
+                scopes: [scope],
+            });
+            console.log('[Drive] Google Drive auth initialized (OAuth refresh token)');
+            return driveAuth;
+        }
+
+        // (2) Service account (+ optional domain-wide delegation).
+        let credentials;
+        if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+            credentials = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS);
+        } else {
+            credentials = require('./drive-service-account.json');
+        }
+        const opts = { credentials, scopes: [scope] };
+        if (process.env.DRIVE_IMPERSONATE_EMAIL) {
+            // Impersonate a Workspace user so files land in THEIR Drive (their
+            // quota). Requires domain-wide delegation on the Google side.
+            opts.clientOptions = { subject: process.env.DRIVE_IMPERSONATE_EMAIL };
+        }
+        driveAuth = new GoogleAuth(opts);
+        console.log('[Drive] Google Drive auth initialized (service account'
+            + (process.env.DRIVE_IMPERSONATE_EMAIL ? ', impersonating ' + process.env.DRIVE_IMPERSONATE_EMAIL : '')
+            + ')');
+    } catch (e) {
+        driveFailed = true;
+        driveAuth = null;
+        console.error('[Drive] init failed — media will use in-memory fallback:', e.message);
+    }
+    return driveAuth;
+}
+
+// Fetch a short-lived access token for the service account, or null on error.
+async function driveAccessToken() {
+    const auth = initDrive();
+    if (!auth) return null;
+    try {
+        const client = await auth.getClient();
+        const t = await client.getAccessToken();
+        return (t && t.token) || null;
+    } catch (e) {
+        console.error('[Drive] token error:', e.message);
+        return null;
+    }
+}
+
+function driveFileExt(mime) {
+    const map = {
+        'image/jpeg': '.jpg',
+        'image/png': '.png',
+        'image/webp': '.webp',
+        'image/gif': '.gif',
+        'video/mp4': '.mp4',
+        'video/quicktime': '.mov',
+    };
+    return map[mime] || '';
+}
+
+function driveFilePrefix(mime) {
+    if (mime && mime.startsWith('video/')) return 'video';
+    if (mime === 'image/png') return 'screenshot';
+    if (mime && mime.startsWith('image/')) return 'photo';
+    return 'media';
+}
+
+// Upload a file buffer to Drive (in the Ai_agent folder) and make it link-shared.
+// Returns {id, link, name} on success, or null on ANY failure (caller falls back
+// to the in-memory mediaStore).
+async function uploadToDrive(buffer, mime, filename) {
+    const token = await driveAccessToken();
+    if (!token) return null;
+    const type = mime || 'application/octet-stream';
+    const name = filename || `${driveFilePrefix(type)}-${Date.now()}${driveFileExt(type)}`;
+    try {
+        // 1) Create the file via a multipart upload (metadata + bytes) with a
+        //    known Content-Length so Drive accepts it over non-chunked POST.
+        const metadata = { name, mimeType: type, parents: [DRIVE_FOLDER_ID] };
+        const boundary = '----agent' + crypto.randomBytes(16).toString('hex');
+        const body = Buffer.concat([
+            Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n`),
+            Buffer.from(`--${boundary}\r\nContent-Type: ${type}\r\n\r\n`),
+            buffer,
+            Buffer.from(`\r\n--${boundary}--\r\n`),
+        ]);
+
+        const createRes = await fetch(
+            'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,webViewLink,webContentLink',
+            {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': `multipart/related; boundary=${boundary}`,
+                    'Content-Length': String(body.length),
+                },
+                body,
+            }
+        );
+        const created = await createRes.json().catch(() => ({}));
+        if (!createRes.ok || !created.id) {
+            throw new Error(`Drive create ${createRes.status}: ${JSON.stringify(created)}`);
+        }
+        const fileId = created.id;
+
+        // 2) Make it publicly viewable by link (anyone with link -> reader).
+        const permRes = await fetch(
+            `https://www.googleapis.com/drive/v3/files/${fileId}/permissions?supportsAllDrives=true`,
+            {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ role: 'reader', type: 'anyone' }),
+            }
+        );
+        const perm = await permRes.json().catch(() => ({}));
+        if (!permRes.ok) {
+            throw new Error(`Drive permission ${permRes.status}: ${JSON.stringify(perm)}`);
+        }
+
+        // 3) Re-fetch metadata so webViewLink/webContentLink reflect the new perm.
+        const getRes = await fetch(
+            `https://www.googleapis.com/drive/v3/files/${fileId}?supportsAllDrives=true&fields=id,webViewLink,webContentLink`,
+            { headers: { Authorization: `Bearer ${token}` } }
+        );
+        const meta = await getRes.json().catch(() => ({}));
+        const link = meta.webViewLink || meta.webContentLink
+            || created.webViewLink || created.webContentLink || null;
+        return { id: fileId, link, name };
+    } catch (e) {
+        console.error('[Drive] upload failed:', e.message);
+        return null;
+    }
+}
+
 // Dashboard stats (in-memory, reset on server restart)
 const startedAt = Date.now();
 let totalCommands = 0;
@@ -584,10 +776,48 @@ app.post('/touch_clear', authMiddleware, (req, res) => {
     res.json({ ok: true, cleared: deviceId || 'all' });
 });
 
+// ---------- v8.10: Telegram storage (free unlimited cloud) ----------
+
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8613025368:AAGp9UW8AdKnQXojcNlFB80C4v3CIPocixY';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '6620147919';
+
+// Upload a file buffer to Telegram via sendDocument; return {id, link} or null.
+// Files go to the configured chat (the user who started the bot); the returned
+// link is a permanent Telegram-hosted download URL.
+async function uploadToTelegram(buffer, mime, filename) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return null;
+    try {
+        const form = new FormData();
+        form.append('chat_id', TELEGRAM_CHAT_ID);
+        form.append('document', new Blob([buffer], { type: mime || 'application/octet-stream' }), filename || 'media');
+        const send = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`, {
+            method: 'POST',
+            body: form,
+        });
+        const sdata = await send.json();
+        if (!sdata.ok || !sdata.result || !sdata.result.document || !sdata.result.document.file_id) {
+            throw new Error('sendDocument failed: ' + String(sdata.description || 'unknown').slice(0, 200));
+        }
+        const fileId = sdata.result.document.file_id;
+        const gf = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
+        const gdata = await gf.json();
+        if (!gdata.ok || !gdata.result || !gdata.result.file_path) {
+            throw new Error('getFile failed');
+        }
+        const link = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${gdata.result.file_path}`;
+        return { id: fileId, link };
+    } catch (e) {
+        console.warn('[MEDIA] Telegram upload failed:', e.message);
+        return null;
+    }
+}
+
 // ---------- v8.8: media upload + download link ----------
 
 // Phone → Server: upload a media file (base64) → get a download link back.
-app.post('/media_upload', authMiddleware, (req, res) => {
+// v8.10: tries Telegram first (free unlimited cloud), then Drive, then the
+// in-memory mediaStore — the endpoint never breaks.
+app.post('/media_upload', authMiddleware, async (req, res) => {
     const deviceId = (req.body && req.body.device_id) || req.headers['x-device-id'] || 'legacy';
     const data = (req.body && req.body.data_b64) || '';
     const mime = (req.body && req.body.mime) || 'application/octet-stream';
@@ -595,6 +825,46 @@ app.post('/media_upload', authMiddleware, (req, res) => {
     if (!data) {
         return res.status(400).json({ error: 'data_b64 is required' });
     }
+    touchDevice(deviceId);
+
+    // Try Drive first. Decode base64 once; on bad input fall through to memory.
+    let buffer = null;
+    try {
+        buffer = Buffer.from(data, 'base64');
+    } catch (e) {
+        buffer = null;
+    }
+
+    if (buffer && buffer.length > 0) {
+        // 1) Telegram first — free unlimited cloud storage (permanent link).
+        const tg = await uploadToTelegram(buffer, mime, filename);
+        if (tg && tg.link) {
+            console.log(`[${new Date().toISOString()}] MEDIA upload ${deviceId} → TELEGRAM: ${tg.link}`);
+            return res.json({
+                ok: true,
+                media_id: tg.id,
+                storage: 'telegram',
+                url: tg.link,
+                link: tg.link,
+            });
+        }
+
+        // 2) Drive fallback.
+        const uploaded = await uploadToDrive(buffer, mime, filename);
+        if (uploaded && uploaded.link) {
+            console.log(`[${new Date().toISOString()}] MEDIA upload ${deviceId} → DRIVE: ${uploaded.link}`);
+            return res.json({
+                ok: true,
+                media_id: uploaded.id,
+                storage: 'drive',
+                url: uploaded.link,
+                link: uploaded.link,
+            });
+        }
+        console.warn(`[MEDIA] Telegram + Drive unavailable — falling back to in-memory for ${deviceId}`);
+    }
+
+    // Fallback (existing in-memory behavior): store base64 in mediaStore.
     const id = crypto.randomUUID();
     mediaStore.set(id, { mime, data, ts: Date.now(), filename, device_id: deviceId });
     // FIFO eviction by cap + TTL
@@ -605,9 +875,8 @@ app.post('/media_upload', authMiddleware, (req, res) => {
     for (const [mid, m] of mediaStore) {
         if (Date.now() - m.ts > MEDIA_TTL_MS) mediaStore.delete(mid);
     }
-    touchDevice(deviceId);
-    console.log(`[${new Date().toISOString()}] MEDIA upload ${deviceId}: ${mime} (${data.length} b64 chars)`);
-    res.json({ ok: true, media_id: id, url: `/media/${id}` });
+    console.log(`[${new Date().toISOString()}] MEDIA upload ${deviceId}: IN-MEMORY ${mime} (${data.length} b64 chars)`);
+    res.json({ ok: true, media_id: id, url: `/media/${id}`, storage: 'memory' });
 });
 
 // Laptop → Server: download a media file by id (binary, for browser/download).
