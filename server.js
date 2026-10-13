@@ -442,7 +442,7 @@ app.post('/register_fcm', authMiddleware, (req, res) => {
 // Laptop → Server: Wait for result (long-poll up to timeout)
 app.get('/get_result', authMiddleware, async (req, res) => {
     const { id, timeout_ms } = req.query;
-    const timeout = Math.min(parseInt(timeout_ms) || 25000, 55000);
+    const timeout = Math.min(parseInt(timeout_ms) || 30000, 120000);
     const start = Date.now();
 
     if (!id) {
