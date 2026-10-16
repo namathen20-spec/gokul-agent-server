@@ -5,7 +5,9 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const http = require('http');
 const { Readable } = require('stream');
+const { WebSocketServer, WebSocket } = require('ws');
 require('dotenv').config();
 
 const app = express();
@@ -1140,13 +1142,116 @@ document.getElementById('t').textContent='LIVE • '+new Date().toLocaleTimeStri
 </body></html>`);
 });
 
+// =============================================================================
+// v10: WebRTC SIGNALING (peer-to-peer media, relay only forwards SDP/ICE).
+// The phone and the browser connect to wss://<host>/signal?room=<device_id>&role=
+// <phone|browser>. The relay keys sockets by (room, role) and FORWARDS JSON
+// messages between them. Media flows peer-to-peer (phone <-> browser) over the
+// ICE-candidate (STUN) negotiated path — the free Render relay is NOT in the
+// media path, so its bandwidth is never a bottleneck for live video/audio.
+//
+// Message protocol (JSON, forwarded verbatim + a `from` tag):
+//   { type: 'start'  }                          peer announces it is ready/streaming
+//   { type: 'offer',  sdp: {type, sdp} }        phone -> browser (SDP offer)
+//   { type: 'answer', sdp: {type, sdp} }        browser -> phone (SDP answer)
+//   { type: 'ice',    candidate: {candidate, sdpMid, sdpMLineIndex} }  either way
+//   { type: 'stop'  }                           peer announces it is tearing down
+//
+// Minimal + stateless per room: a room is created lazily on first connect and
+// deleted when the last socket leaves. Messages sent with no live peer in the
+// opposite role are simply dropped (no buffering).
+// =============================================================================
+const signalRooms = new Map(); // room -> { phone: Set<ws>, browser: Set<ws> }
+
+function signalPeerSet(room, role) {
+    let r = signalRooms.get(room);
+    const other = role === 'phone' ? 'browser' : 'phone';
+    if (!r) {
+        r = { phone: new Set(), browser: new Set() };
+        signalRooms.set(room, r);
+    }
+    return { roomEntry: r, peerSet: r[other] };
+}
+
+function signalRoute(room, role) {
+    let r = signalRooms.get(room);
+    if (!r) {
+        r = { phone: new Set(), browser: new Set() };
+        signalRooms.set(room, r);
+    }
+    return r[role];
+}
+
+function signalDropRoom(room, entry) {
+    const r = signalRooms.get(room);
+    if (!r) return;
+    if (r.phone.size === 0 && r.browser.size === 0) {
+        signalRooms.delete(room);
+    }
+}
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/signal' });
+
+wss.on('connection', (socket, req) => {
+    let room = '';
+    let role = 'browser';
+    try {
+        const u = new URL(req.url, 'https://gokul-agent-server.onrender.com');
+        room = (u.searchParams.get('room') || '').trim();
+        role = (u.searchParams.get('role') || 'browser').toLowerCase();
+    } catch (e) {
+        // fall through; invalid URL → treated as an anonymous browser socket and
+        // simply won't match anyone (harmless).
+    }
+    if (role !== 'phone' && role !== 'browser') role = 'browser';
+    if (!room) {
+        socket.close(4000, 'missing room');
+        return;
+    }
+
+    const self = signalRoute(room, role);
+    self.add(socket);
+    console.log(`[signal] ${role} joined room '${room}' (${self.size} in role)`);
+
+    socket.on('message', (data) => {
+        let msg;
+        try {
+            msg = JSON.parse(data.toString());
+        } catch (e) {
+            return; // non-JSON frames are ignored
+        }
+        if (!msg || typeof msg.type !== 'string') return;
+
+        // Attach the sender's role so the receiver can disambiguate.
+        const forward = Object.assign({}, msg, { from: role });
+        const { roomEntry, peerSet } = signalPeerSet(room, role);
+        for (const peer of peerSet) {
+            if (peer.readyState === WebSocket.OPEN) {
+                try { peer.send(JSON.stringify(forward)); } catch (e) { /* ignore */ }
+            }
+        }
+    });
+
+    socket.on('close', () => {
+        self.delete(socket);
+        console.log(`[signal] ${role} left room '${room}' (${self.size} in role)`);
+        signalDropRoom(room);
+    });
+
+    socket.on('error', (e) => {
+        // keep the server alive; the 'close' handler does cleanup
+    });
+});
+
 // Start
-app.listen(PORT, () => {
+server.listen(PORT, () => {
     console.log('='.repeat(50));
     console.log('🤖 Remote AI Agent - Cloud Server v3 (multi-device)');
     console.log('='.repeat(50));
     console.log(`✅ Server running on port ${PORT}`);
     console.log(`✅ API Key: ${API_KEY.substring(0, 5)}...`);
     console.log(`✅ Health: http://localhost:${PORT}/health`);
+    console.log(`✅ WebRTC signaling: ws://localhost:${PORT}/signal`);
     console.log('='.repeat(50));
 });
